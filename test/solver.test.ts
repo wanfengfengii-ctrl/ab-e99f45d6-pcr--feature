@@ -2,14 +2,15 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { buildInstance, allocate } from '../src/allocate.js';
 import { solve, type SolverInstance } from '../src/solver.js';
+import { toMicroUnits } from '../src/decimal.js';
 import type { AllocateRequest } from '../src/types.js';
 
 /* ----------------------------- brute-force oracle ----------------------------- */
 
 interface OracleResult {
   assignment: number[];
-  maxRisk: number;
-  totalRisk: number;
+  maxRisk: bigint;
+  totalRisk: bigint;
   spread: number;
 }
 
@@ -21,16 +22,16 @@ function oracle(inst: SolverInstance): OracleResult | null {
   const enumerate = (u: number): void => {
     if (u === n) {
       const pl = new Array<number>(k).fill(0);
-      const pr = new Array<number>(k).fill(0);
+      const pr = new Array<bigint>(k).fill(0n);
       const pc = new Array<number>(k).fill(0);
       const used = new Array<boolean>(k).fill(false);
       for (let i = 0; i < n; i++) {
-        const j = assign[i]!;
-        pl[j]! += loads[i]!;
-        pc[j]! += isControl[i] ? 1 : 0;
-        used[j] = true;
+        const jj = assign[i]!;
+        pl[jj]! += loads[i]!;
+        pc[jj]! += isControl[i] ? 1 : 0;
+        used[jj] = true;
         for (let w = 0; w < i; w++) {
-          if (assign[w] === j) pr[j]! += risk[i * n + w]!;
+          if (assign[w] === jj) pr[jj]! += risk[i * n + w]!;
         }
       }
       for (let j = 0; j < k; j++) {
@@ -42,8 +43,12 @@ function oracle(inst: SolverInstance): OracleResult | null {
           }
         }
       }
-      const maxRisk = Math.max(...pr);
-      const totalRisk = pr.reduce((a, b) => a + b, 0);
+      let maxRisk = pr[0]!;
+      let totalRisk = 0n;
+      for (let j = 0; j < k; j++) {
+        if (pr[j]! > maxRisk) maxRisk = pr[j]!;
+        totalRisk += pr[j]!;
+      }
       const spread = Math.max(...pl) - Math.min(...pl);
       const cand: OracleResult = { assignment: [...assign], maxRisk, totalRisk, spread };
       if (
@@ -138,6 +143,80 @@ test('solver matches brute-force oracle on random small instances', () => {
   assert.ok(feasibleCount > 50, `expected many feasible random cases, got ${feasibleCount}`);
 });
 
+/* -------------- random differential testing with exact decimal risks -------------- */
+
+function canonical(micro: bigint): string {
+  const whole = micro / 1_000_000n;
+  const frac = micro % 1_000_000n;
+  if (frac === 0n) return whole.toString();
+  return `${whole.toString()}.${frac.toString().padStart(6, '0').replace(/0+$/, '')}`;
+}
+
+test('solver matches brute-force oracle on random small DECIMAL instances', () => {
+  const rng = makeRng(20261004);
+  let feasibleCount = 0;
+  for (let t = 0; t < 300; t++) {
+    const n = 4 + Math.floor(rng() * 5); // 4..8
+    const k = 2 + Math.floor(rng() * 2); // 2..3
+    const names = Array.from({ length: n }, (_, i) => `D${i}`);
+    const loads = Array.from({ length: n }, () => 1 + Math.floor(rng() * 6));
+    const isControl = Array.from({ length: n }, () => rng() < 0.45);
+    if (!isControl.some(Boolean)) isControl[0] = true;
+    const total = loads.reduce((a, b) => a + b, 0);
+    const minLoad = 1 + Math.floor(rng() * Math.min(4, Math.floor(total / k)));
+    const maxLoad = Math.max(minLoad, Math.floor(total / k) + Math.floor(rng() * 8));
+    // Threshold with decimals: 5.5 micro-units... expressed as a string.
+    const thresholdMicro = 5_500_000n;
+    const riskPairs: { a: string; b: string; risk: number | string }[] = [];
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        if (rng() < 0.45) {
+          // Either a fractional decimal spelled as a string, or a whole
+          // integer spelled as a number (the two wire formats may be mixed).
+          if (rng() < 0.6) {
+            const v = 1_000_001n + BigInt(Math.floor(rng() * 9_000_000));
+            riskPairs.push({ a: names[i]!, b: names[j]!, risk: canonical(v) });
+          } else {
+            riskPairs.push({ a: names[i]!, b: names[j]!, risk: 1 + Math.floor(rng() * 9) });
+          }
+        }
+      }
+    }
+    const req: AllocateRequest = {
+      amplicons: names.map((name, i) => ({ name, load: loads[i]!, isControl: isControl[i]! })),
+      poolCount: k,
+      loadRange: { min: minLoad, max: maxLoad },
+      riskPairs: riskPairs as AllocateRequest['riskPairs'],
+      hardThreshold: rng() < 0.5 ? canonical(thresholdMicro) : 5,
+    };
+    const inst = buildInstance(req);
+    // Sanity: the wire values reached the instance exactly.
+    for (const rp of req.riskPairs) {
+      const ix = names.indexOf(rp.a);
+      const jx = names.indexOf(rp.b);
+      assert.equal(
+        inst.risk[ix * n + jx],
+        toMicroUnits(rp.risk),
+        `case ${t}: risk ${rp.a}/${rp.b} parsed exactly`,
+      );
+    }
+    const expected = oracle(inst);
+    const actual = solve(inst);
+    if (expected === null) {
+      assert.equal(actual, null, `decimal case ${t}: solver should report infeasible`);
+    } else {
+      feasibleCount++;
+      assert.ok(actual, `decimal case ${t}: solver should find a solution`);
+      assert.deepEqual(
+        [actual!.maxRisk, actual!.totalRisk, actual!.spread, actual!.assignment],
+        [expected.maxRisk, expected.totalRisk, expected.spread, expected.assignment],
+        `decimal case ${t}: objective mismatch`,
+      );
+    }
+  }
+  assert.ok(feasibleCount > 30, `expected many feasible decimal cases, got ${feasibleCount}`);
+});
+
 /* ----------------------------- hard-constraint checks ----------------------------- */
 
 function assertHardConstraints(req: AllocateRequest) {
@@ -198,7 +277,7 @@ test('non-greedy trap: greedy is feasible but suboptimal, exact solver hits risk
   // Every pool is forced to anchor(30) + control(10) + one heavy item(30) = 70.
   const greedyAssignment = simulateGreedy(req);
   assert.ok(greedyAssignment, 'greedy finds a feasible layout');
-  assert.equal(maxRiskOf(req, greedyAssignment!), 7, 'greedy leaves risk-7 pairs co-located');
+  assert.equal(maxRiskOf(req, greedyAssignment!), 7_000_000n, 'greedy leaves risk-7 pairs co-located');
 
   // Exact optimum deranges a/b/d away from X/Y/Z: no listed soft risk at all.
   assert.equal(res.maxPoolRisk, 0);
@@ -211,10 +290,11 @@ function simulateGreedy(req: AllocateRequest): number[] | null {
   const loads = new Array<number>(k).fill(0);
   const controls = new Array<number>(k).fill(0);
   const members: string[][] = Array.from({ length: k }, () => []);
-  const riskOf = new Map<string, number>();
+  const riskOf = new Map<string, bigint>();
   for (const rp of req.riskPairs) {
-    riskOf.set(rp.a < rp.b ? `${rp.a}|${rp.b}` : `${rp.b}|${rp.a}`, rp.risk);
+    riskOf.set(rp.a < rp.b ? `${rp.a}|${rp.b}` : `${rp.b}|${rp.a}`, toMicroUnits(rp.risk));
   }
+  const threshold = toMicroUnits(req.hardThreshold);
   const assignment: number[] = [];
   for (const amp of req.amplicons) {
     let chosen = -1;
@@ -222,7 +302,7 @@ function simulateGreedy(req: AllocateRequest): number[] | null {
       const fits = loads[j]! + amp.load <= req.loadRange.max;
       const ok = members[j]!.every((m) => {
         const key = m < amp.name ? `${m}|${amp.name}` : `${amp.name}|${m}`;
-        return (riskOf.get(key) ?? 0) < req.hardThreshold;
+        return (riskOf.get(key) ?? 0n) < threshold;
       });
       if (fits && ok && (chosen === -1 || loads[j]! < loads[chosen]!)) chosen = j;
     }
@@ -238,23 +318,23 @@ function simulateGreedy(req: AllocateRequest): number[] | null {
   return assignment;
 }
 
-function maxRiskOf(req: AllocateRequest, assignment: number[]): number {
-  const riskOf = new Map<string, number>();
+function maxRiskOf(req: AllocateRequest, assignment: number[]): bigint {
+  const riskOf = new Map<string, bigint>();
   for (const rp of req.riskPairs) {
-    riskOf.set(rp.a < rp.b ? `${rp.a}|${rp.b}` : `${rp.b}|${rp.a}`, rp.risk);
+    riskOf.set(rp.a < rp.b ? `${rp.a}|${rp.b}` : `${rp.b}|${rp.a}`, toMicroUnits(rp.risk));
   }
-  const sums = new Array<number>(req.poolCount).fill(0);
+  const sums = new Array<bigint>(req.poolCount).fill(0n);
   for (let i = 0; i < assignment.length; i++) {
     for (let w = 0; w < i; w++) {
       if (assignment[i] === assignment[w]) {
         const ni = req.amplicons[i]!.name;
         const nw = req.amplicons[w]!.name;
         const key = ni < nw ? `${ni}|${nw}` : `${nw}|${ni}`;
-        sums[assignment[i]! - 1]! += riskOf.get(key) ?? 0;
+        sums[assignment[i]! - 1]! += riskOf.get(key) ?? 0n;
       }
     }
   }
-  return Math.max(...sums);
+  return sums.reduce((a, b) => (a > b ? a : b));
 }
 
 /* ------------------------------- lex tie-break -------------------------------- */

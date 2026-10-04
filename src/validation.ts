@@ -1,7 +1,13 @@
 import type { AllocateRequest, ValidationIssue } from './types.js';
+import { isCanonicalDecimalString } from './decimal.js';
 
 const isInt = (v: unknown): v is number =>
   typeof v === 'number' && Number.isSafeInteger(v);
+
+/** Message used when a string risk value is not a canonical decimal. */
+const RISK_STRING_MESSAGE =
+  'must be a canonical non-negative decimal string with at most 6 fractional digits ' +
+  '(no sign, exponent, leading zeros or meaningless trailing zeros)';
 
 /**
  * Validate a parsed request body. Returns the list of issues with field
@@ -81,6 +87,10 @@ export function validateRequest(body: unknown): ValidationIssue[] {
   // ---- hardThreshold ----
   if (!('hardThreshold' in req)) {
     issues.push({ field: 'hardThreshold', message: 'is required' });
+  } else if (typeof req.hardThreshold === 'string') {
+    if (!isCanonicalDecimalString(req.hardThreshold)) {
+      issues.push({ field: 'hardThreshold', message: RISK_STRING_MESSAGE });
+    }
   } else if (!isInt(req.hardThreshold) || req.hardThreshold < 0) {
     issues.push({ field: 'hardThreshold', message: 'must be a non-negative integer' });
   }
@@ -113,7 +123,11 @@ export function validateRequest(body: unknown): ValidationIssue[] {
           issues.push({ field: `${p}.${k}`, message: `unknown amplicon name "${rp[k]}"` });
         }
       }
-      if (!isInt(rp.risk) || rp.risk < 0) {
+      if (typeof rp.risk === 'string') {
+        if (!isCanonicalDecimalString(rp.risk)) {
+          issues.push({ field: `${p}.risk`, message: RISK_STRING_MESSAGE });
+        }
+      } else if (!isInt(rp.risk) || rp.risk < 0) {
         issues.push({ field: `${p}.risk`, message: 'must be a non-negative integer' });
       }
       if (typeof rp.a === 'string' && typeof rp.b === 'string' && rp.a === rp.b) {

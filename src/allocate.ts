@@ -3,7 +3,13 @@ import {
   solve,
   type SolverInstance,
 } from './solver.js';
-import type { AllocateRequest, AllocateResponse, PoolResult } from './types.js';
+import { canonicalMicro, toMicroUnits } from './decimal.js';
+import type {
+  AllocateRequest,
+  AllocateResponse,
+  PoolResult,
+  RiskResult,
+} from './types.js';
 
 export function buildInstance(req: AllocateRequest): SolverInstance {
   const n = req.amplicons.length;
@@ -12,16 +18,25 @@ export function buildInstance(req: AllocateRequest): SolverInstance {
   const loads = req.amplicons.map((a) => a.load);
   const isControl = req.amplicons.map((a) => a.isControl);
 
-  const risk = new Int32Array(n * n);
+  const risk = new BigInt64Array(n * n);
   const forbidden = new Uint8Array(n * n);
   const index = new Map<string, number>(names.map((name, i) => [name, i]));
 
+  // Any decimal-string input switches the response's risk values to canonical
+  // strings; a purely integer request keeps the historical JSON numbers.
+  const decimalMode =
+    typeof req.hardThreshold === 'string' ||
+    req.riskPairs.some((p) => typeof p.risk === 'string');
+
+  // Threshold comparisons use the exact decimal values.
+  const threshold = toMicroUnits(req.hardThreshold);
   for (const p of req.riskPairs) {
     const i = index.get(p.a)!;
     const j = index.get(p.b)!;
-    risk[i * n + j] = p.risk;
-    risk[j * n + i] = p.risk;
-    if (p.risk >= req.hardThreshold) {
+    const r = toMicroUnits(p.risk);
+    risk[i * n + j] = r;
+    risk[j * n + i] = r;
+    if (r >= threshold) {
       forbidden[i * n + j] = 1;
       forbidden[j * n + i] = 1;
     }
@@ -37,6 +52,7 @@ export function buildInstance(req: AllocateRequest): SolverInstance {
     minLoad: req.loadRange.min,
     maxLoad: req.loadRange.max,
     forbidden,
+    decimalMode,
   };
 }
 
@@ -47,6 +63,11 @@ export function allocate(req: AllocateRequest): AllocateResponse {
   if (!sol) {
     return { feasible: false, conflictSummary: buildConflictSummary(inst) };
   }
+
+  // Any decimal-string input switches the entire response's risk values to
+  // canonical strings; a purely integer request keeps the historical numbers.
+  const out = (v: bigint): RiskResult =>
+    inst.decimalMode ? canonicalMicro(v) : Number(v / 1_000_000n);
 
   const pools: PoolResult[] = [];
   for (let j = 0; j < inst.k; j++) {
@@ -64,7 +85,7 @@ export function allocate(req: AllocateRequest): AllocateResponse {
         const i = memberIdx[x]!;
         const w = memberIdx[y]!;
         const r = inst.risk[i * inst.n + w]!;
-        if (r > 0) riskPairs.push({ a: inst.names[i]!, b: inst.names[w]!, risk: r });
+        if (r > 0n) riskPairs.push({ a: inst.names[i]!, b: inst.names[w]!, risk: out(r) });
       }
     }
     pools.push({
@@ -73,7 +94,7 @@ export function allocate(req: AllocateRequest): AllocateResponse {
       load: sol.poolLoads[j]!,
       controls,
       riskPairs,
-      riskSum: sol.poolRisk[j]!,
+      riskSum: out(sol.poolRisk[j]!),
     });
   }
 
@@ -81,38 +102,43 @@ export function allocate(req: AllocateRequest): AllocateResponse {
     feasible: true,
     poolCount: inst.k,
     pools,
-    maxPoolRisk: sol.maxRisk,
-    totalRisk: sol.totalRisk,
+    maxPoolRisk: out(sol.maxRisk),
+    totalRisk: out(sol.totalRisk),
     loadSpread: sol.spread,
     assignment: sol.assignment.map((p, i) => ({ amplicon: inst.names[i]!, pool: p + 1 })),
   };
 }
 
 function buildConflictSummary(inst: SolverInstance) {
-  const forbiddenPairs: { a: string; b: string; risk: number }[] = [];
+  // Integer numbers for purely integer requests, canonical decimal strings
+  // whenever the request contained any string risk value.
+  const out = (v: bigint): RiskResult =>
+    inst.decimalMode ? canonicalMicro(v) : Number(v / 1_000_000n);
+
+  const forbiddenPairs: { a: string; b: string; risk: RiskResult }[] = [];
   for (let i = 0; i < inst.n; i++) {
     for (let j = i + 1; j < inst.n; j++) {
       if (inst.forbidden[i * inst.n + j]) {
         forbiddenPairs.push({
           a: inst.names[i]!,
           b: inst.names[j]!,
-          risk: inst.risk[i * inst.n + j]!,
+          risk: out(inst.risk[i * inst.n + j]!),
         });
       }
     }
   }
 
   const reason = obviousInfeasibility(inst);
-  const out: NonNullable<AllocateResponse['conflictSummary']> = {
+  const summary: NonNullable<AllocateResponse['conflictSummary']> = {
     forbiddenPairs,
     overCapacityClique: [],
   };
 
   const controlCount = inst.isControl.filter(Boolean).length;
-  if (controlCount < inst.k) out.poolsWithoutControl = inst.k - controlCount;
-  if (reason?.kind === 'load') out.loadIssue = reason.detail;
+  if (controlCount < inst.k) summary.poolsWithoutControl = inst.k - controlCount;
+  if (reason?.kind === 'load') summary.loadIssue = reason.detail;
   if (reason?.kind === 'clique' && reason.clique) {
-    out.overCapacityClique = reason.clique.map((i) => inst.names[i]!);
+    summary.overCapacityClique = reason.clique.map((i) => inst.names[i]!);
   }
-  return out;
+  return summary;
 }

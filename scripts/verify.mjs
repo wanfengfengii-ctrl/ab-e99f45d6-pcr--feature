@@ -48,7 +48,7 @@ if (run('npx', ['tsc', '-p', 'tsconfig.json']) !== 0) {
 /* -------------------------------- stage 2: tests ------------------------------- */
 if ((failures & 1) === 0) {
   log('test', 'running node:test suite...');
-  if (run('node', ['--test', 'dist/test/solver.test.js', 'dist/test/api.test.js', 'dist/test/scale.test.js']) !== 0) {
+  if (run('node', ['--test', 'dist/test/solver.test.js', 'dist/test/api.test.js', 'dist/test/scale.test.js', 'dist/test/decimal.test.js', 'dist/test/decimal-api.test.js']) !== 0) {
     fail('test', 'test suite failed');
     failures |= 2;
   }
@@ -235,6 +235,102 @@ if (healthy) {
     expect(clique.json.feasible === false, 'K3-into-2-pools reported infeasible');
     const cq = new Set(clique.json.conflictSummary?.overCapacityClique ?? []);
     expect(cq.size === 3 && ['A0', 'A1', 'A2'].every((x) => cq.has(x)), 'conflict summary lists the K3 clique');
+
+    /* ---------- six-decimal-place exact decimal risk (precision trap) ---------- */
+    // Values such as 0.07/0.2/0.3 are not exactly representable in float64.
+    // A double-based optimizer accumulates a competing partition as
+    // 0.5700000000000001 and wrongly prefers it; exact decimal comparison must
+    // instead find the partition with true total 0.56 (pool maxima 0.30/0.26).
+    const decEdges = [
+      ['A0', 'A1', '0.05'], ['A0', 'A3', '0.07'], ['A0', 'A6', '0.2'], ['A0', 'A7', '0.07'],
+      ['A1', 'A6', '0.3'], ['A2', 'A3', '0.3'], ['A2', 'A4', '0.05'], ['A2', 'A6', '0.05'],
+      ['A2', 'A7', '0.2'], ['A3', 'A4', '0.2'], ['A3', 'A5', '0.2'], ['A3', 'A7', '0.07'],
+      ['A4', 'A7', '0.07'], ['A5', 'A6', '0.2'], ['A6', 'A7', '0.3'],
+    ];
+    const decimalReq = {
+      amplicons: Array.from({ length: 8 }, (_, i) => ({ name: `A${i}`, load: 10, isControl: true })),
+      poolCount: 2,
+      loadRange: { min: 40, max: 40 },
+      riskPairs: [
+        ...decEdges.map(([a, b, risk]) => ({ a, b, risk })),
+        { a: 'A0', b: 'A4', risk: 5 }, // integer number mixed with decimal strings
+      ],
+      hardThreshold: '9',
+    };
+    const dec = await post(decimalReq);
+    expect(dec.status === 200, `decimal request HTTP status 200 (got ${dec.status})`);
+    const dj = dec.json;
+    expect(dj.feasible === true, 'decimal request feasible');
+    if (dj.feasible) {
+      // Every risk value in the response is a canonical, zero-trimmed string.
+      const canonical = /^(?:0|[1-9][0-9]*)(?:\.[0-9]{0,5}[1-9])?$/;
+      expect(typeof dj.maxPoolRisk === 'string' && canonical.test(dj.maxPoolRisk), `maxPoolRisk canonical string (${dj.maxPoolRisk})`);
+      expect(typeof dj.totalRisk === 'string' && canonical.test(dj.totalRisk), `totalRisk canonical string (${dj.totalRisk})`);
+
+      // Recompute all sums with exact integer micro-units, client-side.
+      const micro = (v) => {
+        if (typeof v === 'number') return BigInt(Math.round(v * 1e6));
+        const d = v.indexOf('.');
+        return d === -1 ? BigInt(v) * 1000000n : BigInt(v.slice(0, d)) * 1000000n + BigInt(v.slice(d + 1).padEnd(6, '0'));
+      };
+      let decTotal = 0n;
+      let decMax = 0n;
+      for (const p of dj.pools) {
+        expect(typeof p.riskSum === 'string', `pool ${p.pool} riskSum is a string`);
+        let sum = 0n;
+        for (const rp of p.riskPairs) {
+          expect(typeof rp.risk === 'string' && canonical.test(rp.risk), `pair risk canonical (${rp.risk})`);
+          sum += micro(rp.risk);
+        }
+        expect(sum === micro(p.riskSum), `pool ${p.pool} riskSum ${p.riskSum} equals recomputed pairs`);
+        decTotal += sum;
+        if (sum > decMax) decMax = sum;
+      }
+      expect(decTotal === micro(dj.totalRisk), `totalRisk ${dj.totalRisk} equals sum of pool sums`);
+      expect(decMax === micro(dj.maxPoolRisk), `maxPoolRisk ${dj.maxPoolRisk} equals largest pool sum`);
+
+      // The precision-sensitive optimum: 0.56, not float64's 0.57.
+      expect(dj.totalRisk === '0.56', `exact decimal totalRisk is 0.56 (got ${dj.totalRisk}; float64 yields 0.57)`);
+      expect(dj.maxPoolRisk === '0.3', `exact decimal maxPoolRisk is 0.3 (got ${dj.maxPoolRisk})`);
+
+      // Determinism holds for decimal requests too.
+      const dec2 = await post(decimalReq);
+      expect(JSON.stringify(dec2.json) === JSON.stringify(dj), 'decimal request is byte-identical on repeat');
+    }
+
+    // Non-canonical decimal strings are rejected at the precise field.
+    const badDec = await post({
+      amplicons: Array.from({ length: 8 }, (_, i) => ({ name: `A${i}`, load: 10, isControl: true })),
+      poolCount: 2,
+      loadRange: { min: 40, max: 40 },
+      riskPairs: [
+        { a: 'A0', b: 'A1', risk: '1.50' },   // meaningless trailing zeros
+        { a: 'A2', b: 'A3', risk: '0.1e1' },   // exponent
+      ],
+      hardThreshold: '+9',                     // sign
+    });
+    expect(badDec.status === 400, `non-canonical decimals HTTP 400 (got ${badDec.status})`);
+    const badDecFields = new Set((badDec.json.issues ?? []).map((i) => i.field));
+    for (const f of ['riskPairs[0].risk', 'riskPairs[1].risk', 'hardThreshold']) {
+      expect(badDecFields.has(f), `non-canonical decimal located at ${f}`);
+    }
+
+    // Legal but infeasible with a fractional threshold: the conflict summary
+    // echoes canonical decimal strings.
+    const decClique = await post({
+      amplicons: Array.from({ length: 8 }, (_, i) => ({ name: `A${i}`, load: 10, isControl: true })),
+      poolCount: 2,
+      loadRange: { min: 10, max: 400 },
+      riskPairs: [
+        { a: 'A0', b: 'A1', risk: '9.5' },
+        { a: 'A0', b: 'A2', risk: '9.5' },
+        { a: 'A1', b: 'A2', risk: '9.5' },
+      ],
+      hardThreshold: '9.5',
+    });
+    expect(decClique.json.feasible === false, 'fractional-threshold clique infeasible');
+    const dcp = decClique.json.conflictSummary?.forbiddenPairs ?? [];
+    expect(dcp.length === 3 && dcp.every((p) => p.risk === '9.5'), 'conflict summary risks are canonical "9.5" strings');
   } catch (err) {
     expect(false, `API check threw: ${err instanceof Error ? err.stack : err}`);
   }

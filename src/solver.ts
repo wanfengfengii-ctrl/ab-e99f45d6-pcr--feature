@@ -33,20 +33,29 @@ export interface SolverInstance {
   names: string[];
   loads: number[];
   isControl: boolean[];
-  /** Symmetric n*n risk matrix (unlisted pairs are 0). */
-  risk: Int32Array;
+  /**
+   * Symmetric n*n risk matrix in exact micro-units (10^-6), bigint so that
+   * six-decimal-place sums never hit float rounding (unlisted pairs are 0).
+   */
+  risk: BigInt64Array;
   minLoad: number;
   maxLoad: number;
   /** Only *listed* pairs with risk >= threshold are hard-forbidden. */
   forbidden: Uint8Array;
+  /**
+   * True when the request carried at least one decimal-string risk value; the
+   * response then renders every risk value as a canonical decimal string.
+   */
+  decimalMode: boolean;
 }
 
 export interface SolverSolution {
   assignment: number[];
   poolLoads: number[];
-  poolRisk: number[];
-  maxRisk: number;
-  totalRisk: number;
+  /** Per-pool risk sums in exact micro-units. */
+  poolRisk: bigint[];
+  maxRisk: bigint;
+  totalRisk: bigint;
   spread: number;
 }
 
@@ -153,13 +162,13 @@ export function obviousInfeasibility(
 
 interface SearchState {
   poolLoad: Int32Array;
-  poolRisk: Int32Array;
+  poolRisk: BigInt64Array;
   poolControl: Int32Array;
   members: Int32Array;
   assignment: Int8Array;
   remMask: number;
-  curMaxRisk: number;
-  curTotalRisk: number;
+  curMaxRisk: bigint;
+  curTotalRisk: bigint;
 }
 
 export function solve(inst: SolverInstance): SolverSolution | null {
@@ -178,13 +187,13 @@ export function solve(inst: SolverInstance): SolverSolution | null {
 
   const newState = (): SearchState => ({
     poolLoad: new Int32Array(k),
-    poolRisk: new Int32Array(k),
+    poolRisk: new BigInt64Array(k),
     poolControl: new Int32Array(k),
     members: new Int32Array(k),
     assignment: new Int8Array(n),
     remMask: (1 << n) - 1,
-    curMaxRisk: 0,
-    curTotalRisk: 0,
+    curMaxRisk: 0n,
+    curTotalRisk: 0n,
   });
 
   let nodes = 0;
@@ -206,8 +215,8 @@ export function solve(inst: SolverInstance): SolverSolution | null {
     return mask;
   };
 
-  const addedRisk = (st: SearchState, u: number, j: number): number => {
-    let added = 0;
+  const addedRisk = (st: SearchState, u: number, j: number): bigint => {
+    let added = 0n;
     let mm = st.members[j]!;
     while (mm) {
       const wv = mm & -mm;
@@ -357,7 +366,7 @@ export function solve(inst: SolverInstance): SolverSolution | null {
     return true;
   };
 
-  const place = (st: SearchState, u: number, j: number): { added: number; prevMax: number } => {
+  const place = (st: SearchState, u: number, j: number): { added: bigint; prevMax: bigint } => {
     const added = addedRisk(st, u, j);
     st.poolLoad[j]! += loads[u]!;
     st.poolRisk[j]! += added;
@@ -371,7 +380,7 @@ export function solve(inst: SolverInstance): SolverSolution | null {
     return { added, prevMax };
   };
 
-  const unplace = (st: SearchState, u: number, j: number, added: number, prevMax: number): void => {
+  const unplace = (st: SearchState, u: number, j: number, added: bigint, prevMax: bigint): void => {
     st.curMaxRisk = prevMax;
     st.curTotalRisk -= added;
     st.remMask |= 1 << u;
@@ -385,8 +394,9 @@ export function solve(inst: SolverInstance): SolverSolution | null {
 
   const st = newState();
   let bestAssignment: Int8Array | null = null;
-  let bestMax = Infinity;
-  let bestTotal = Infinity;
+  // Bigint sentinels: an actual risk sum is always non-negative.
+  let bestMax = -1n;
+  let bestTotal = -1n;
   let bestSpread = Infinity;
 
   const firstEmptyPool = (): number => {
@@ -425,12 +435,16 @@ export function solve(inst: SolverInstance): SolverSolution | null {
       return;
     }
 
-    if (st.curMaxRisk > bestMax) return;
-    if (st.curMaxRisk === bestMax && st.curTotalRisk > bestTotal) return;
+    if (bestAssignment !== null) {
+      if (st.curMaxRisk > bestMax) return;
+      if (st.curMaxRisk === bestMax && st.curTotalRisk > bestTotal) return;
+    }
     // We only need a STRICTLY better spread to replace the incumbent, so a
     // completion whose spread cannot beat bestSpread-1 is irrelevant.
     const spreadTarget =
-      st.curMaxRisk === bestMax && st.curTotalRisk === bestTotal && Number.isFinite(bestSpread)
+      bestAssignment !== null &&
+      st.curMaxRisk === bestMax &&
+      st.curTotalRisk === bestTotal
         ? bestSpread - 1
         : null;
     if (!prefixFeasible(st, rem, spreadTarget)) {
@@ -458,7 +472,7 @@ export function solve(inst: SolverInstance): SolverSolution | null {
     }
 
     const u = bestU;
-    const branches: { j: number; added: number }[] = [];
+    const branches: { j: number; added: bigint }[] = [];
     let cb = allowedMaskFor(st, u) & legalMask;
     while (cb) {
       const j = 31 - Math.clz32(cb & -cb);
@@ -488,9 +502,11 @@ export function solve(inst: SolverInstance): SolverSolution | null {
     branches.length = 0;
     branches.push(...distinct);
     // Least added risk first, then lightest pool: strong early incumbent.
-    branches.sort(
-      (p, q) => p.added - q.added || st.poolLoad[p.j]! - st.poolLoad[q.j]! || p.j - q.j,
-    );
+    branches.sort((p, q) => {
+      if (p.added < q.added) return -1;
+      if (p.added > q.added) return 1;
+      return st.poolLoad[p.j]! - st.poolLoad[q.j]! || p.j - q.j;
+    });
 
     for (const { j } of branches) {
       const { added, prevMax } = place(st, u, j);
@@ -573,13 +589,13 @@ export function solve(inst: SolverInstance): SolverSolution | null {
       // Phase 2 restarts from an empty state: numeric objectives are fixed and
       // it searches for the lexicographically smallest full labelling.
       st.poolLoad.fill(0);
-      st.poolRisk.fill(0);
+      st.poolRisk.fill(0n);
       st.poolControl.fill(0);
       st.members.fill(0);
       st.assignment.fill(-1);
       st.remMask = (1 << n) - 1;
-      st.curMaxRisk = 0;
-      st.curTotalRisk = 0;
+      st.curMaxRisk = 0n;
+      st.curTotalRisk = 0n;
       phase2(0);
     }
   } catch (e) {
@@ -591,10 +607,10 @@ export function solve(inst: SolverInstance): SolverSolution | null {
 
   if (lexBest === null) return null;
   const poolLoads: number[] = [];
-  const poolRisks: number[] = [];
+  const poolRisks: bigint[] = [];
   for (let j = 0; j < k; j++) {
     let load = 0;
-    let rsum = 0;
+    let rsum = 0n;
     for (let i = 0; i < n; i++) {
       if (lexBest[i] === j) {
         load += loads[i]!;
@@ -608,9 +624,9 @@ export function solve(inst: SolverInstance): SolverSolution | null {
     assignment: Array.from(lexBest),
     poolLoads,
     poolRisk: poolRisks,
-    maxRisk: Number(bestMax),
-    totalRisk: Number(bestTotal),
-    spread: Number(bestSpread),
+    maxRisk: bestMax,
+    totalRisk: bestTotal,
+    spread: bestSpread,
   };
 }
 

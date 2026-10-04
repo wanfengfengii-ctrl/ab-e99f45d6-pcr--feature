@@ -47,8 +47,10 @@ docker compose run --rm verify
 3. wait for the app's `/health` endpoint,
 4. live API checks including a **non-greedy trap** (the greedy "emptiest pool"
    layout realizes risk 7 per pool; the service must return the exact risk-0,
-   perfectly balanced allocation, independently re-verified), invalid-input
-   field localization and legal-but-infeasible conflict summaries.
+   perfectly balanced allocation, independently re-verified), an
+   **exact-decimal precision trap** (six-dp risks where float64 summation picks
+   the wrong partition; the response must report the exact canonical result),
+   invalid-input field localization and legal-but-infeasible conflict summaries.
 
 Exit mask: `1` build, `2` tests, `4` health, `8` API — `0` means all passed.
 
@@ -87,8 +89,37 @@ APP_URL=http://127.0.0.1:3000 VERIFY_CWD=$PWD node scripts/verify.mjs
 | `amplicons` | 8–18 unique non-empty names; `load` positive integer; `isControl` boolean |
 | `poolCount` | integer 2–4 |
 | `loadRange` | positive integers, `min <= max` |
-| `riskPairs` | unordered pairs of known, distinct names; `risk` non-negative integer; no duplicates |
-| `hardThreshold` | non-negative integer; a listed pair with `risk >= hardThreshold` is forbidden |
+| `riskPairs` | unordered pairs of known, distinct names; `risk` non-negative integer **or canonical decimal string**; no duplicates |
+| `hardThreshold` | non-negative integer **or canonical decimal string**; a listed pair with `risk >= hardThreshold` is forbidden |
+
+### Exact decimal risks (six decimal places)
+
+Thermodynamic dimer-risk values may carry up to six fractional digits. Such a
+value is sent as a **canonical decimal string**: digits with an optional single
+`.` followed by 1–6 digits, no sign, no exponent, no leading zeros and no
+meaningless trailing zeros (`"0.05"`, `"0.3"`, `"9.999999"` — not `"+.5"`,
+`"5e-1"`, `"0.30"` or `"01"`). Integer risks stay plain JSON numbers, and the
+two formats may be mixed in one request:
+
+```json
+"riskPairs": [
+  { "a": "X", "b": "Y", "risk": "0.07" },
+  { "a": "X", "b": "Z", "risk": 9 }
+],
+"hardThreshold": "9.5"
+```
+
+As soon as **any** risk value (a pair risk or `hardThreshold`) is a string,
+threshold comparisons, per-pool risk sums, the maximum/total risk and the
+four-level objective decision all use **exact decimal arithmetic** — never
+float64, which would otherwise mis-rank layouts (e.g. accumulating a worse
+`0.5700000000000001` above the true optimum `0.56`). Every risk value in the
+response is then a canonical decimal string with meaningless zeros removed
+(including `"0"`), so a laboratory can independently re-add the pair lists
+digit-for-digit. A request containing only integer numbers behaves exactly as
+before: numeric JSON fields, same status codes and the same allocation.
+Malformed decimal strings are rejected at the precise field
+(`riskPairs[3].risk`, `hardThreshold`). Unlisted pairs remain risk `0`.
 
 Success (`200`):
 
@@ -144,8 +175,9 @@ Legal but unsatisfiable (`200`):
 ```
 src/
   types.ts       request/response contracts
+  decimal.ts     canonical decimal parsing/rendering + exact micro-unit math
   validation.ts  structural validation with field locators
-  solver.ts      exact two-phase branch-and-bound
+  solver.ts      exact two-phase branch-and-bound (exact bigint risk sums)
   allocate.ts    instance construction and response assembly
   server.ts      node:http service (/health, /api/pools/allocate)
 test/            differential tests vs a brute-force oracle + HTTP tests
