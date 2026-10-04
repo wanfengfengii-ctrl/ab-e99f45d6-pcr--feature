@@ -11,14 +11,27 @@ export interface AmpliconInput {
   isControl: boolean;
 }
 
+/**
+ * Risk score or threshold as accepted on input and returned on output.
+ *
+ * Input: a non-negative integer (legacy format) or a canonical decimal
+ * string with up to six fraction digits (see decimal.ts). Integers and
+ * strings may be mixed within one request.
+ *
+ * Output: once any string risk appears in the request, every risk figure is
+ * reported as a canonical decimal string (insignificant zeros stripped);
+ * pure-integer requests keep plain numbers.
+ */
+export type RiskValue = number | string;
+
 /** Unordered amplicon pair with a non-negative dimer risk score. */
 export interface RiskPairInput {
   /** Amplicon name (order of a/b does not matter). */
   a: string;
   /** Amplicon name (order of a/b does not matter). */
   b: string;
-  /** Non-negative integer risk score. */
-  risk: number;
+  /** Non-negative risk score: integer or canonical decimal string. */
+  risk: RiskValue;
 }
 
 export interface AllocateRequest {
@@ -29,7 +42,7 @@ export interface AllocateRequest {
   loadRange: { min: number; max: number };
   riskPairs: RiskPairInput[];
   /** Pairs whose risk reaches this value are forbidden from sharing a pool. */
-  hardThreshold: number;
+  hardThreshold: RiskValue;
 }
 
 export interface PoolResult {
@@ -37,13 +50,13 @@ export interface PoolResult {
   members: string[];
   load: number;
   controls: string[];
-  riskPairs: { a: string; b: string; risk: number }[];
-  riskSum: number;
+  riskPairs: { a: string; b: string; risk: RiskValue }[];
+  riskSum: RiskValue;
 }
 
 export interface ConflictSummary {
   /** Forbidden pairs (risk >= hardThreshold); a feasible partition may still exist. */
-  forbiddenPairs: { a: string; b: string; risk: number }[];
+  forbiddenPairs: { a: string; b: string; risk: RiskValue }[];
   /**
    * Clique (set of pairwise forbidden amplicons) that is larger than the
    * available pool count, proving impossibility of the hard constraints.
@@ -59,8 +72,8 @@ export interface AllocateResponse {
   feasible: boolean;
   poolCount?: number;
   pools?: PoolResult[];
-  maxPoolRisk?: number;
-  totalRisk?: number;
+  maxPoolRisk?: RiskValue;
+  totalRisk?: RiskValue;
   loadSpread?: number;
   assignment?: { amplicon: string; pool: number }[];
   conflictSummary?: ConflictSummary;

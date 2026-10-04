@@ -33,12 +33,19 @@ export interface SolverInstance {
   names: string[];
   loads: number[];
   isControl: boolean[];
-  /** Symmetric n*n risk matrix (unlisted pairs are 0). */
-  risk: Int32Array;
+  /**
+   * Symmetric n*n risk matrix (unlisted pairs are 0). Int32Array for legacy
+   * integer requests; Float64Array of exact micro-units (value × 1e6) when
+   * decimal-string risks are present. All values stay far below 2^53, so
+   * number arithmetic on either representation is exact.
+   */
+  risk: Int32Array | Float64Array;
   minLoad: number;
   maxLoad: number;
   /** Only *listed* pairs with risk >= threshold are hard-forbidden. */
   forbidden: Uint8Array;
+  /** True when risks are exact-decimal micro-units (string inputs present). */
+  decimal?: boolean;
 }
 
 export interface SolverSolution {
@@ -153,7 +160,8 @@ export function obviousInfeasibility(
 
 interface SearchState {
   poolLoad: Int32Array;
-  poolRisk: Int32Array;
+  /** Exact risk sums: integers for legacy requests, micro-units in decimal mode. */
+  poolRisk: Float64Array;
   poolControl: Int32Array;
   members: Int32Array;
   assignment: Int8Array;
@@ -178,7 +186,7 @@ export function solve(inst: SolverInstance): SolverSolution | null {
 
   const newState = (): SearchState => ({
     poolLoad: new Int32Array(k),
-    poolRisk: new Int32Array(k),
+    poolRisk: new Float64Array(k),
     poolControl: new Int32Array(k),
     members: new Int32Array(k),
     assignment: new Int8Array(n),

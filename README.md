@@ -47,7 +47,9 @@ docker compose run --rm verify
 3. wait for the app's `/health` endpoint,
 4. live API checks including a **non-greedy trap** (the greedy "emptiest pool"
    layout realizes risk 7 per pool; the service must return the exact risk-0,
-   perfectly balanced allocation, independently re-verified), invalid-input
+   perfectly balanced allocation, independently re-verified), an
+   **exact-decimal precision trap** (`0.1 + 0.2` must surface as `"0.3"` in
+   pool sums, max and totals, with mixed integer/string inputs), invalid-input
    field localization and legal-but-infeasible conflict summaries.
 
 Exit mask: `1` build, `2` tests, `4` health, `8` API — `0` means all passed.
@@ -87,8 +89,33 @@ APP_URL=http://127.0.0.1:3000 VERIFY_CWD=$PWD node scripts/verify.mjs
 | `amplicons` | 8–18 unique non-empty names; `load` positive integer; `isControl` boolean |
 | `poolCount` | integer 2–4 |
 | `loadRange` | positive integers, `min <= max` |
-| `riskPairs` | unordered pairs of known, distinct names; `risk` non-negative integer; no duplicates |
-| `hardThreshold` | non-negative integer; a listed pair with `risk >= hardThreshold` is forbidden |
+| `riskPairs` | unordered pairs of known, distinct names; `risk` non-negative integer **or canonical decimal string** (see below); no duplicates |
+| `hardThreshold` | non-negative integer **or canonical decimal string**; a listed pair with `risk >= hardThreshold` is forbidden |
+
+### Exact-decimal risk scores
+
+Upgraded thermodynamic evaluation emits fractional dimer risks. Any
+`riskPairs[].risk` and/or `hardThreshold` may be a **canonical decimal
+string** with up to six fraction digits — e.g. `"0.5"`, `"3.141593"`,
+`"0.000001"`. Integers and strings may be mixed freely within one request;
+unlisted pairs still count as risk 0.
+
+Canonical means: no sign, no exponent, no leading zeros, and no
+insignificant trailing zeros in the fraction (`"1.5"`, not `"1.50"`). The
+integer part is limited to 7 digits (values up to `9999999.999999`) so that
+every internal sum stays exactly representable. Non-canonical strings are
+rejected with `400` and the usual field-located `issues`.
+
+Once any string appears, every comparison and sum (threshold adjudication,
+per-pool risk sums, max/total risk and the four-level objective order) is
+computed in exact decimal — internally the values become integers in
+micro-units (×10⁶), so binary floating point can never flip a forbidden-pair
+decision or re-order equally good allocations. All risk figures in the
+response (`pools[].riskPairs[].risk`, `pools[].riskSum`, `maxPoolRisk`,
+`totalRisk` and `conflictSummary.forbiddenPairs[].risk`) are then returned
+as canonical decimal strings with insignificant zeros stripped (`"3"`,
+`"0.3"`); pure-integer requests keep the original numeric types, status
+codes and allocation semantics unchanged.
 
 Success (`200`):
 
@@ -144,6 +171,7 @@ Legal but unsatisfiable (`200`):
 ```
 src/
   types.ts       request/response contracts
+  decimal.ts     canonical decimal strings <-> exact micro-unit integers
   validation.ts  structural validation with field locators
   solver.ts      exact two-phase branch-and-bound
   allocate.ts    instance construction and response assembly

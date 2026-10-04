@@ -12,6 +12,10 @@
  *        - an invalid request (field-located errors)
  *        - a legal-but-infeasible request (conflict summary)
  *        - determinism: the same feasible request twice yields the same body
+ *        - exact-decimal risk mode: a precision trap (0.1 + 0.2 must stay
+ *          exactly "0.3" through sums, max and totals), mixed integer/string
+ *          requests, field-located rejection of non-canonical decimal
+ *          strings and canonical decimal conflict summaries
  *
  * Exit code is a bit mask (0 = everything passed):
  *   1  build failure
@@ -48,7 +52,7 @@ if (run('npx', ['tsc', '-p', 'tsconfig.json']) !== 0) {
 /* -------------------------------- stage 2: tests ------------------------------- */
 if ((failures & 1) === 0) {
   log('test', 'running node:test suite...');
-  if (run('node', ['--test', 'dist/test/solver.test.js', 'dist/test/api.test.js', 'dist/test/scale.test.js']) !== 0) {
+  if (run('node', ['--test', 'dist/test/solver.test.js', 'dist/test/api.test.js', 'dist/test/scale.test.js', 'dist/test/decimal.test.js']) !== 0) {
     fail('test', 'test suite failed');
     failures |= 2;
   }
@@ -235,6 +239,122 @@ if (healthy) {
     expect(clique.json.feasible === false, 'K3-into-2-pools reported infeasible');
     const cq = new Set(clique.json.conflictSummary?.overCapacityClique ?? []);
     expect(cq.size === 3 && ['A0', 'A1', 'A2'].every((x) => cq.has(x)), 'conflict summary lists the K3 clique');
+
+    /* --------- exact-decimal risk mode (thermodynamic upgrade) --------- */
+
+    // Convert a canonical decimal string to integer micro-units for exact
+    // client-side recomputation (mirrors the service's internal model).
+    const toMicro = (v) => {
+      const s = String(v);
+      const dot = s.indexOf('.');
+      if (dot === -1) return Number(s) * 1_000_000;
+      const frac = s.slice(dot + 1);
+      return Number(s.slice(0, dot)) * 1_000_000 + Number(frac) * 10 ** (6 - frac.length);
+    };
+
+    // Precision trap: integer cross-forbids (mixed formats in one request)
+    // pin D0..D3 into one pool, so the 0.1 + 0.2 sum must surface exactly as
+    // "0.3" — binary floating point would report 0.30000000000000004 and
+    // could flip the max-risk adjudication.
+    const decAmp = Array.from({ length: 8 }, (_, i) => ({ name: `D${i}`, load: 10, isControl: true }));
+    const decCross = [];
+    for (const x of ['D0', 'D1', 'D2', 'D3']) {
+      for (const y of ['D4', 'D5', 'D6', 'D7']) decCross.push({ a: x, b: y, risk: 1 });
+    }
+    const decReq = {
+      amplicons: decAmp,
+      poolCount: 2,
+      loadRange: { min: 40, max: 40 },
+      riskPairs: [
+        { a: 'D0', b: 'D1', risk: '0.1' },
+        { a: 'D2', b: 'D3', risk: '0.2' },
+        ...decCross,
+      ],
+      hardThreshold: '0.4',
+    };
+    const rd = await post(decReq);
+    expect(rd.status === 200, `decimal request HTTP 200 (got ${rd.status})`);
+    const jd = rd.json;
+    expect(jd.feasible === true, 'decimal request is feasible');
+    if (jd.feasible) {
+      expect(jd.maxPoolRisk === '0.3', `decimal max pool risk is exactly "0.3" (got ${JSON.stringify(jd.maxPoolRisk)})`);
+      expect(jd.totalRisk === '0.3', `decimal total risk is exactly "0.3" (got ${JSON.stringify(jd.totalRisk)})`);
+      expect(typeof jd.loadSpread === 'number' && jd.loadSpread === 0, 'load spread stays a number');
+      const heavy = jd.pools.find((p) => p.members.includes('D0'));
+      expect(
+        heavy && ['D0', 'D1', 'D2', 'D3'].every((m) => heavy.members.includes(m)),
+        'D0..D3 co-located by the integer cross-forbids',
+      );
+      expect(heavy && heavy.riskSum === '0.3', `heavy pool riskSum is "0.3" (got ${JSON.stringify(heavy?.riskSum)})`);
+
+      // Independent recomputation: detail sums, totals and max must agree,
+      // and every reported risk must be a canonical decimal string.
+      const canonical = (s) =>
+        typeof s === 'string' && /^(0|[1-9]\d*)(\.\d{1,6})?$/.test(s) && !(s.includes('.') && s.endsWith('0'));
+      let totMicro = 0;
+      let maxMicro = 0;
+      for (const p of jd.pools) {
+        let sum = 0;
+        for (const rp of p.riskPairs) {
+          expect(canonical(rp.risk), `pool ${p.pool} pair risk ${JSON.stringify(rp.risk)} is canonical`);
+          expect(toMicro(rp.risk) < toMicro(decReq.hardThreshold), `pool ${p.pool} pair below hard threshold`);
+          sum += toMicro(rp.risk);
+        }
+        expect(toMicro(p.riskSum) === sum, `pool ${p.pool} riskSum ${p.riskSum} equals recomputed pair sum`);
+        totMicro += sum;
+        maxMicro = Math.max(maxMicro, sum);
+      }
+      expect(toMicro(jd.totalRisk) === totMicro, 'totalRisk equals the sum of pool risk sums');
+      expect(toMicro(jd.maxPoolRisk) === maxMicro, 'maxPoolRisk equals the largest pool risk sum');
+
+      // Forbidden pairs are separated (exact decimal comparison client-side).
+      const whereD = new Map();
+      jd.pools.forEach((p) => p.members.forEach((m) => whereD.set(m, p.pool)));
+      for (const rp of decReq.riskPairs) {
+        if (toMicro(rp.risk) >= toMicro(decReq.hardThreshold)) {
+          expect(whereD.get(rp.a) !== whereD.get(rp.b), `forbidden pair ${rp.a}/${rp.b} separated`);
+        }
+      }
+    }
+
+    // Non-canonical decimal strings are rejected with field-located issues.
+    for (const bad of ['+1', '1.50', '01', '1e3', '1.1234567']) {
+      const r = await post({ ...decReq, riskPairs: [{ a: 'D0', b: 'D1', risk: bad }] });
+      expect(r.status === 400, `risk ${JSON.stringify(bad)} rejected with 400 (got ${r.status})`);
+      expect(
+        (r.json.issues ?? []).some((i) => i.field === 'riskPairs[0].risk'),
+        `risk ${JSON.stringify(bad)} located at riskPairs[0].risk`,
+      );
+    }
+    const badThr = await post({ ...decReq, hardThreshold: '-0.5' });
+    expect(badThr.status === 400, 'negative-string threshold rejected with 400');
+    expect(
+      (badThr.json.issues ?? []).some((i) => i.field === 'hardThreshold'),
+      'negative-string threshold located at hardThreshold',
+    );
+
+    // Legal but infeasible decimal request: conflict summary uses the same
+    // canonical decimal strings so the lab can recompute the adjudication.
+    const decInf = await post({
+      amplicons: decAmp,
+      poolCount: 2,
+      loadRange: { min: 40, max: 40 },
+      riskPairs: [
+        { a: 'D0', b: 'D1', risk: '0.5' },
+        { a: 'D0', b: 'D2', risk: '0.5' },
+        { a: 'D1', b: 'D2', risk: '0.5' },
+      ],
+      hardThreshold: '0.5',
+    });
+    expect(decInf.status === 200, `decimal infeasible HTTP 200 (got ${decInf.status})`);
+    expect(decInf.json.feasible === false, 'decimal K3 reported infeasible');
+    expect(
+      (decInf.json.conflictSummary?.forbiddenPairs ?? []).length === 3 &&
+        decInf.json.conflictSummary.forbiddenPairs.every((p) => p.risk === '0.5'),
+      'conflict summary forbidden pairs use canonical decimal strings',
+    );
+    const dq = new Set(decInf.json.conflictSummary?.overCapacityClique ?? []);
+    expect(dq.size === 3 && ['D0', 'D1', 'D2'].every((x) => dq.has(x)), 'conflict summary lists the decimal K3 clique');
   } catch (err) {
     expect(false, `API check threw: ${err instanceof Error ? err.stack : err}`);
   }
@@ -252,7 +372,7 @@ if (healthy) {
 
 /* ---------------------------------- summary ---------------------------------- */
 if (failures === 0) {
-  log('result', 'ALL STAGES PASSED (build, tests, health, API incl. non-greedy trap)');
+  log('result', 'ALL STAGES PASSED (build, tests, health, API incl. non-greedy trap and exact-decimal checks)');
 } else {
   fail('result', `verification failed with exit mask ${failures} (build=1 tests=2 health=4 api=8)`);
 }

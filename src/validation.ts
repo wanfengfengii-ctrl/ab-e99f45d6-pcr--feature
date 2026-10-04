@@ -1,7 +1,58 @@
 import type { AllocateRequest, ValidationIssue } from './types.js';
+import {
+  CANONICAL_DECIMAL_RE,
+  MAX_DECIMAL_INT_DIGITS,
+  MAX_DECIMAL_INT_VALUE,
+  decimalIntDigits,
+} from './decimal.js';
 
 const isInt = (v: unknown): v is number =>
   typeof v === 'number' && Number.isSafeInteger(v);
+
+/** True when any risk figure in the request uses the decimal-string format. */
+function hasDecimalString(req: Record<string, unknown>): boolean {
+  if (typeof req.hardThreshold === 'string') return true;
+  if (Array.isArray(req.riskPairs)) {
+    for (const item of req.riskPairs) {
+      if (
+        item !== null &&
+        typeof item === 'object' &&
+        !Array.isArray(item) &&
+        typeof (item as Record<string, unknown>).risk === 'string'
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Validate one risk score / threshold value. Returns the issue message, or
+ * null when valid. Non-string values keep the legacy integer message so
+ * pure-integer requests see unchanged error semantics.
+ */
+function riskValueIssue(v: unknown, decimalMode: boolean): string | null {
+  if (typeof v === 'string') {
+    if (!CANONICAL_DECIMAL_RE.test(v)) {
+      return 'must be a canonical decimal string: non-negative, no sign, no exponent, no leading zeros, with 1 to 6 fraction digits';
+    }
+    if (v.includes('.') && v.endsWith('0')) {
+      return 'must not carry insignificant trailing zeros (write "1.5", not "1.50")';
+    }
+    if (decimalIntDigits(v) > MAX_DECIMAL_INT_DIGITS) {
+      return `exceeds the exact-decimal limit of ${MAX_DECIMAL_INT_VALUE}.999999`;
+    }
+    return null;
+  }
+  if (!isInt(v) || v < 0) {
+    return 'must be a non-negative integer';
+  }
+  if (decimalMode && v > MAX_DECIMAL_INT_VALUE) {
+    return `exceeds the exact-decimal limit of ${MAX_DECIMAL_INT_VALUE} for integer values mixed with decimal strings`;
+  }
+  return null;
+}
 
 /**
  * Validate a parsed request body. Returns the list of issues with field
@@ -15,6 +66,7 @@ export function validateRequest(body: unknown): ValidationIssue[] {
     return issues;
   }
   const req = body as Record<string, unknown>;
+  const decimalMode = hasDecimalString(req);
 
   // ---- amplicons ----
   const ampliconsPath = 'amplicons';
@@ -81,8 +133,9 @@ export function validateRequest(body: unknown): ValidationIssue[] {
   // ---- hardThreshold ----
   if (!('hardThreshold' in req)) {
     issues.push({ field: 'hardThreshold', message: 'is required' });
-  } else if (!isInt(req.hardThreshold) || req.hardThreshold < 0) {
-    issues.push({ field: 'hardThreshold', message: 'must be a non-negative integer' });
+  } else {
+    const msg = riskValueIssue(req.hardThreshold, decimalMode);
+    if (msg !== null) issues.push({ field: 'hardThreshold', message: msg });
   }
 
   // ---- riskPairs ----
@@ -113,8 +166,9 @@ export function validateRequest(body: unknown): ValidationIssue[] {
           issues.push({ field: `${p}.${k}`, message: `unknown amplicon name "${rp[k]}"` });
         }
       }
-      if (!isInt(rp.risk) || rp.risk < 0) {
-        issues.push({ field: `${p}.risk`, message: 'must be a non-negative integer' });
+      const riskMsg = riskValueIssue(rp.risk, decimalMode);
+      if (riskMsg !== null) {
+        issues.push({ field: `${p}.risk`, message: riskMsg });
       }
       if (typeof rp.a === 'string' && typeof rp.b === 'string' && rp.a === rp.b) {
         issues.push({ field: p, message: 'a and b must reference different amplicons' });

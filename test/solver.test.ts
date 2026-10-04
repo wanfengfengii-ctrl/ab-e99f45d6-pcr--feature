@@ -213,7 +213,7 @@ function simulateGreedy(req: AllocateRequest): number[] | null {
   const members: string[][] = Array.from({ length: k }, () => []);
   const riskOf = new Map<string, number>();
   for (const rp of req.riskPairs) {
-    riskOf.set(rp.a < rp.b ? `${rp.a}|${rp.b}` : `${rp.b}|${rp.a}`, rp.risk);
+    riskOf.set(rp.a < rp.b ? `${rp.a}|${rp.b}` : `${rp.b}|${rp.a}`, Number(rp.risk));
   }
   const assignment: number[] = [];
   for (const amp of req.amplicons) {
@@ -222,7 +222,7 @@ function simulateGreedy(req: AllocateRequest): number[] | null {
       const fits = loads[j]! + amp.load <= req.loadRange.max;
       const ok = members[j]!.every((m) => {
         const key = m < amp.name ? `${m}|${amp.name}` : `${amp.name}|${m}`;
-        return (riskOf.get(key) ?? 0) < req.hardThreshold;
+        return (riskOf.get(key) ?? 0) < Number(req.hardThreshold);
       });
       if (fits && ok && (chosen === -1 || loads[j]! < loads[chosen]!)) chosen = j;
     }
@@ -241,7 +241,7 @@ function simulateGreedy(req: AllocateRequest): number[] | null {
 function maxRiskOf(req: AllocateRequest, assignment: number[]): number {
   const riskOf = new Map<string, number>();
   for (const rp of req.riskPairs) {
-    riskOf.set(rp.a < rp.b ? `${rp.a}|${rp.b}` : `${rp.b}|${rp.a}`, rp.risk);
+    riskOf.set(rp.a < rp.b ? `${rp.a}|${rp.b}` : `${rp.b}|${rp.a}`, Number(rp.risk));
   }
   const sums = new Array<number>(req.poolCount).fill(0);
   for (let i = 0; i < assignment.length; i++) {

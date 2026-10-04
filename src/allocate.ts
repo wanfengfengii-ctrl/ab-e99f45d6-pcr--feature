@@ -3,7 +3,8 @@ import {
   solve,
   type SolverInstance,
 } from './solver.js';
-import type { AllocateRequest, AllocateResponse, PoolResult } from './types.js';
+import { formatMicro, riskToMicro } from './decimal.js';
+import type { AllocateRequest, AllocateResponse, PoolResult, RiskValue } from './types.js';
 
 export function buildInstance(req: AllocateRequest): SolverInstance {
   const n = req.amplicons.length;
@@ -12,16 +13,26 @@ export function buildInstance(req: AllocateRequest): SolverInstance {
   const loads = req.amplicons.map((a) => a.load);
   const isControl = req.amplicons.map((a) => a.isControl);
 
-  const risk = new Int32Array(n * n);
+  // Decimal mode: any string risk figure switches every comparison and sum
+  // to exact micro-units (integers are scaled up too, so mixed requests stay
+  // consistent). Pure-integer requests keep the legacy Int32 representation.
+  const decimal =
+    typeof req.hardThreshold === 'string' || req.riskPairs.some((p) => typeof p.risk === 'string');
+
+  const risk: Int32Array | Float64Array = decimal
+    ? new Float64Array(n * n)
+    : new Int32Array(n * n);
   const forbidden = new Uint8Array(n * n);
+  const threshold = decimal ? riskToMicro(req.hardThreshold) : (req.hardThreshold as number);
   const index = new Map<string, number>(names.map((name, i) => [name, i]));
 
   for (const p of req.riskPairs) {
     const i = index.get(p.a)!;
     const j = index.get(p.b)!;
-    risk[i * n + j] = p.risk;
-    risk[j * n + i] = p.risk;
-    if (p.risk >= req.hardThreshold) {
+    const r = decimal ? riskToMicro(p.risk) : (p.risk as number);
+    risk[i * n + j] = r;
+    risk[j * n + i] = r;
+    if (r >= threshold) {
       forbidden[i * n + j] = 1;
       forbidden[j * n + i] = 1;
     }
@@ -37,6 +48,7 @@ export function buildInstance(req: AllocateRequest): SolverInstance {
     minLoad: req.loadRange.min,
     maxLoad: req.loadRange.max,
     forbidden,
+    decimal,
   };
 }
 
@@ -44,8 +56,12 @@ export function allocate(req: AllocateRequest): AllocateResponse {
   const inst = buildInstance(req);
   const sol = solve(inst);
 
+  // Decimal mode reports every risk figure as a canonical string with
+  // insignificant zeros stripped; integer mode keeps plain numbers.
+  const fmt = (v: number): RiskValue => (inst.decimal ? formatMicro(v) : v);
+
   if (!sol) {
-    return { feasible: false, conflictSummary: buildConflictSummary(inst) };
+    return { feasible: false, conflictSummary: buildConflictSummary(inst, fmt) };
   }
 
   const pools: PoolResult[] = [];
@@ -58,13 +74,13 @@ export function allocate(req: AllocateRequest): AllocateResponse {
     memberIdx.sort((a, b) => a - b);
     const members = memberIdx.map((i) => inst.names[i]!);
     const controls = memberIdx.filter((i) => inst.isControl[i]).map((i) => inst.names[i]!);
-    const riskPairs = [];
+    const riskPairs: { a: string; b: string; risk: RiskValue }[] = [];
     for (let x = 0; x < memberIdx.length; x++) {
       for (let y = x + 1; y < memberIdx.length; y++) {
         const i = memberIdx[x]!;
         const w = memberIdx[y]!;
         const r = inst.risk[i * inst.n + w]!;
-        if (r > 0) riskPairs.push({ a: inst.names[i]!, b: inst.names[w]!, risk: r });
+        if (r > 0) riskPairs.push({ a: inst.names[i]!, b: inst.names[w]!, risk: fmt(r) });
       }
     }
     pools.push({
@@ -73,7 +89,7 @@ export function allocate(req: AllocateRequest): AllocateResponse {
       load: sol.poolLoads[j]!,
       controls,
       riskPairs,
-      riskSum: sol.poolRisk[j]!,
+      riskSum: fmt(sol.poolRisk[j]!),
     });
   }
 
@@ -81,22 +97,22 @@ export function allocate(req: AllocateRequest): AllocateResponse {
     feasible: true,
     poolCount: inst.k,
     pools,
-    maxPoolRisk: sol.maxRisk,
-    totalRisk: sol.totalRisk,
+    maxPoolRisk: fmt(sol.maxRisk),
+    totalRisk: fmt(sol.totalRisk),
     loadSpread: sol.spread,
     assignment: sol.assignment.map((p, i) => ({ amplicon: inst.names[i]!, pool: p + 1 })),
   };
 }
 
-function buildConflictSummary(inst: SolverInstance) {
-  const forbiddenPairs: { a: string; b: string; risk: number }[] = [];
+function buildConflictSummary(inst: SolverInstance, fmt: (v: number) => RiskValue) {
+  const forbiddenPairs: { a: string; b: string; risk: RiskValue }[] = [];
   for (let i = 0; i < inst.n; i++) {
     for (let j = i + 1; j < inst.n; j++) {
       if (inst.forbidden[i * inst.n + j]) {
         forbiddenPairs.push({
           a: inst.names[i]!,
           b: inst.names[j]!,
-          risk: inst.risk[i * inst.n + j]!,
+          risk: fmt(inst.risk[i * inst.n + j]!),
         });
       }
     }
